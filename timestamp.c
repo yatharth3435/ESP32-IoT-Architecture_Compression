@@ -14,6 +14,8 @@
 #include "freertos/task.h"
 #include "timestamp.h"
 #include "uart.h"
+#include "ring_buffer.h"
+#include "compression.h"
 
 // Max Wi-Fi APs to store
 #define WIFI_MAX_AP 6
@@ -40,93 +42,33 @@ volatile bool backlog_complete = false;
 
 // RT Buffer (declared in main.c, defined here for external linkage)
 QueueHandle_t rt_buffer;
-//#define RT_LOWER_THRESHOLD 2
 
-// CMP manual Ring Buffer instance
-cmp_buffer_t cmp_buffer;
 
 // Store reference epoch time (1/1/2025 UTC) to check if sys_time was already updated
 #define REF_EPOCH_TIME 1735689600
 int64_t first_packet_systime;
 
+//timeout to flush cmp buffer in msec
+uint32_t send_data_timeout = 250000;
+int64_t cmp_fill_start;
 
-
-
-
-
-
-
-
-//CMP BUFFER IMPLEMENTATION (Manual Circular Buffer)
-
-//Set up the circular buffer structure with head=0, tail=0, count=0
-void cmp_buffer_init(void) {
-    cmp_buffer.head = 0;
-    cmp_buffer.tail = 0;
-
-    //stores current pointer location
-    cmp_buffer.count = 0;
+//LOGGING
+static void log_buffer_status(const char* location) {
+    uint32_t rt_count = uxQueueMessagesWaiting(rt_buffer);
+    uint32_t cmp_count = cmp_buffer_count();
     
-    //ESP_LOGI("CMP_BUFFER", "Initialized with capacity=%d, LT=%d, UT=%d", CMP_BUFFER_CAPACITY, CMP_BUFFER_LT, CMP_BUFFER_UT);
+    float rt_util = (float)rt_count * 100.0f / RT_BUFFER_SIZE;
+    float cmp_util = (float)cmp_count * 100.0f / CMP_BUFFER_CAPACITY;
+    
+    ESP_LOGI("BUFFER_STATUS", "[%s] RT: %lu/%d (%.1f%%) | CMP: %lu/%d (%.1f%%) | LT: %d", location, rt_count, RT_BUFFER_SIZE, rt_util,
+             cmp_count, CMP_BUFFER_CAPACITY, cmp_util, CMP_BUFFER_LT);
+    
+    // Warning if buffers getting full
+    if (rt_util > 80.0f) ESP_LOGW("BUFFER_STATUS", "RT Buffer >80%% full! Risk of packet loss!");
+
+    if (cmp_util > 80.0f) ESP_LOGW("BUFFER_STATUS", "CMP Buffer >80%% full! HTTP POST may be slow!");
 }
 
-/*
-This function pushes a packet into the CMP buffer, input a pointer to the packet to be pushed
-Returns false if buffer is full. Only timestamp_task writes to this buffer
-*/
-bool cmp_buffer_push(const timestamped_packet_t *packet) {
-
-    // Check if buffer is full
-    if (cmp_buffer.count >= CMP_BUFFER_CAPACITY) {
-        ESP_LOGW("CMP_BUFFER", "Buffer full! Dropping packet. Count=%lu", cmp_buffer.count);
-        return false;
-    }
-    
-    // Copy packet to buffer at head position
-    memcpy(&cmp_buffer.packets[cmp_buffer.head], packet, sizeof(timestamped_packet_t));
-    
-    // Update head pointer (circular) and current count pointer
-    cmp_buffer.head = (cmp_buffer.head + 1) % CMP_BUFFER_CAPACITY;
-    cmp_buffer.count++;
-    
-    return true;
-}
-
-/*
-This function pops a packet from the CMP buffer, input a pointer to the variable storing the popped data
-Returns false if buffer is empty. Only http_post reads from this buffer
-*/
-bool cmp_buffer_pop(timestamped_packet_t *packet) {
-
-    // Check if buffer is empty
-    if (cmp_buffer.count == 0) {
-        return false;
-    }
-    
-    // Copy packet from buffer at tail position
-    memcpy(packet, &cmp_buffer.packets[cmp_buffer.tail], sizeof(timestamped_packet_t));
-    
-    // Update tail pointer (circular) and decrement current count pointer
-    cmp_buffer.tail = (cmp_buffer.tail + 1) % CMP_BUFFER_CAPACITY;
-    cmp_buffer.count--;
-    
-    return true;
-}
-
-
-//Get the current count of packets in buffer, returns the count variable
-uint32_t cmp_buffer_count(void) {
-    return cmp_buffer.count;
-}
-
-
-//Check if CMP buffer is empty. true if empty, false otherwise
-bool cmp_buffer_is_empty(void) {
-    return (cmp_buffer_count() == 0);
-}
-
-
-//END OF BUFFER IMPLEMENTATION
 
 
 /*
@@ -183,7 +125,7 @@ bool wifi_load_last_ap(char* ssid, size_t ssid_len, char* pass, size_t pass_len)
 This function sorts the available Access Points based on RSSI value to determine the order of networks to connect to
 Function parameters: Array to store sorted AP list, Maximum number of APs to scan
 Return Number of APs found
- */
+*/
 int ap_sort(wifi_ap_record_t* ap_list, int max_ap) {
 
     //provide the configuration parameters for wifi ssid scan
@@ -200,9 +142,7 @@ int ap_sort(wifi_ap_record_t* ap_list, int max_ap) {
     return ap_num;
 }
 
-/*
-This function attempts to connect to a given Wi-Fi AP given the credentials, return error handle
-*/
+//This function attempts to connect to a given Wi-Fi AP given the credentials, return error handle
 esp_err_t wifi_conn(const char* ssid, const char* pass) {
 
     //initialize wifi handle, store/set config data for the device's STA or AP
@@ -287,9 +227,7 @@ static void wifi_init(void) {
     } 
     
     //if no successful retrieve from nvs
-    else {
-        ESP_LOGI("WIFI", "No valid NVS credentials found");
-    }
+    else ESP_LOGI("WIFI", "No valid NVS credentials found");
     
 
 
@@ -336,9 +274,7 @@ static void wifi_init(void) {
     }
     
     //if connected is reset here, it means the break at line 312 was executed
-    if (!connected) {
-        ESP_LOGW("WIFI", "Failed to connect to any network, global ssid array is empty...");
-    }
+    if (!connected) ESP_LOGW("WIFI", "Failed to connect to any network, global ssid array is empty...");
 }
 
 
@@ -384,9 +320,11 @@ void sntp_start(void *param) {
     esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
     
     // Set SNTP servers
-    esp_sntp_setservername(0, "pool.ntp.org");    // Google NTP
-    esp_sntp_setservername(1, "time.google.com");   // Cloudflare NTP
-    esp_sntp_setservername(2, "time.aws.com");    // AWS NTP
+    esp_sntp_setservername(0, "pool.ntp.org");    // Pool of NTP servers
+    esp_sntp_setservername(1, "in.pool.ntp.org");   //Pool of NTP servers, IN
+    esp_sntp_setservername(2, "time.google.com");   // Google NTP
+    esp_sntp_setservername(3, "time.aws.com");    // AWS NTP
+    esp_sntp_setservername(4, "time.cloudflare.com");   //CloudFlare NTP
     
     //To view the sntp sync interval (how often sntp sync is requested, currently at 1 hour)
     //ESP_LOGI("SNTP", "Current SNTP sync interval: %lu ms", sntp_get_sync_interval());
@@ -403,130 +341,6 @@ void sntp_start(void *param) {
 }
 
 
-/*
-void timestamp_task(void *param) {
-    //ESP_LOGI("TIMESTAMP_TASK", "Started with highest priority");
-    
-    //create instance of packet struct 
-    timestamped_packet_t packet;
-    bool backlog_processed = false;
-    
-    while (1) {
-
-        struct timeval tv_check;
-        gettimeofday(&tv_check, NULL);
-        bool time_is_valid = (tv_check.tv_sec >= REF_EPOCH_TIME);
-
-
-        // if NTP just synced and backlog hasn't been processed yet
-        if ((ntp_synced || time_is_valid) && !backlog_processed) {
-
-            //LOG: show the first synced times
-            ESP_LOGI("TIMESTAMP_TASK", "NTP SYNCED! Processing backlog...");
-            ESP_LOGI("TIMESTAMP_TASK", "first_synced_epoch = %lld (0x%08lX)", first_synced_epoch, (unsigned long)first_synced_epoch);
-            ESP_LOGI("TIMESTAMP_TASK", "first_synced_esp_ms = %lld", first_synced_esp_ms);
-
-            // If NTP didn't sync but system time is valid, capture reference times now
-            if (!ntp_synced && time_is_valid) {
-                struct timeval tv_now;
-                gettimeofday(&tv_now, NULL);
-                first_synced_epoch = (int64_t)tv_now.tv_sec * 1000L + (int64_t)tv_now.tv_usec / 1000L;
-                first_synced_esp_ms = esp_timer_get_time() / 1000L;
-                ESP_LOGI("TIMESTAMP_TASK", "System time already valid! Using as reference.");
-                ESP_LOGI("TIMESTAMP_TASK", "first_synced_epoch = %lld (0x%08lX)", first_synced_epoch, (unsigned long)first_synced_epoch);
-                ESP_LOGI("TIMESTAMP_TASK", "first_synced_esp_ms = %lld", first_synced_esp_ms);
-            }
-            
-            //LOG: number of packets filled in RT buffer
-            int backlog_count = 0;
-            int rt_count_before = uxQueueMessagesWaiting(rt_buffer);
-            ESP_LOGI("TIMESTAMP_TASK", "RT buffer has %d packets", rt_count_before);
-            
-            // All packets so far in RT buffer were captured before sync
-            //introduce a loop to shift packet-by-packet to struct and do backward timestamp
-            while (xQueueReceive(rt_buffer, &packet, 0) == pdTRUE) {
-
-                //the packet system time before sync
-                int64_t presync_systime = packet.sys_time;
-
-                //the delta/drift between system time and esp timer time (esp timer is always ahead of system timer)
-                int64_t timer_delta = packet.esp_time_ms - presync_systime;
-
-                //backward timestamping formula, all calculations in msec, and finally converted to seconds
-                //first synced epoch time in ms - first synced esp timer time gives epoch time of esp timer init
-                //add to this the pre-sync system time of first packet, and then add drift between both timers
-                packet.sys_time = (first_synced_epoch - first_synced_esp_ms + presync_systime + timer_delta) / 1000L;
-                
-                // Push to CMP buffer
-                if (!cmp_buffer_push(&packet)) ESP_LOGW("TIMESTAMP_TASK", "CMP buffer full during backlog! Packet dropped.");
-                backlog_count++;
-
-                // Yield every 10 packets to allow rx_task to queue new incoming packets
-                //if (backlog_count % 10 == 0) {
-                //    vTaskDelay(1);  
-               // }
-            }
-            
-            //While loop for backward timestamping completed
-            ESP_LOGI("TIMESTAMP_TASK", "Backlog complete: %d packets timestamped", backlog_count);
-            ESP_LOGI("TIMESTAMP_TASK", "CMP buffer now has %lu packets", cmp_buffer_count());
-            ESP_LOGI("TIMESTAMP_TASK", "RT buffer utilization: %d/%d packets", uxQueueMessagesWaiting(rt_buffer), RT_BUFFER_SIZE);
-
-            //set flags for backward timestamping completion
-            backlog_processed = true;
-            backlog_complete = true;
-            
-            // Continue to main while loop for further processing
-            continue;
-        }
-    
-        
-        //if ntp not synced, wait and fill RT buffer itself
-        else if (!ntp_synced) vTaskDelay(pdMS_TO_TICKS(100));
-        
-        //if ntp is synced and no untimestmaped backlog in buffer
-        else {
-            
-            // Check RT buffer level
-            int rt_count = uxQueueMessagesWaiting(rt_buffer);
-            
-            //At lower threshold, send data
-            if (rt_count <= RT_LOWER_THRESHOLD) {
-                if (xQueueReceive(rt_buffer, &packet, pdMS_TO_TICKS(100)) == pdTRUE) {
-
-                    //LOG, RT buffer
-                    static int forward_log_counter = 0;
-                    if (forward_log_counter++ % 50 == 0) {
-                        ESP_LOGI("TIMESTAMP_TASK", "RT buffer utilization: %d/%d packets", uxQueueMessagesWaiting(rt_buffer), RT_BUFFER_SIZE);
-                    }
-                    
-                    //While sending, use gettimeofday() system time for timestamping
-                    struct timeval tv_now;
-                    gettimeofday(&tv_now, NULL);
-                    packet.sys_time = tv_now.tv_sec;
-                    
-                    //LOG: Push to CMP buffer
-                    if (!cmp_buffer_push(&packet)) ESP_LOGW("TIMESTAMP_TASK", "CMP buffer full! Packet dropped.");
-                    //LOG
-                    
-                    //static int log_counter = 0;
-                    //if (log_counter++ % 50 == 0) {
-                    //    ESP_LOGI("TIMESTAMP_TASK", "Forward: epoch=%lld (0x%08lX), RT=%d, CMP=%lu", 
-                    //             packet.sys_time, (unsigned long)packet.sys_time,
-                    //             rt_count, cmp_buffer_count());
-                    //}
-                }
-            } 
-            
-            else vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
-}*/
-
-
-
-
-
 
 
 void timestamp_task(void *param) {
@@ -535,8 +349,19 @@ void timestamp_task(void *param) {
     //create instance of packet struct 
     timestamped_packet_t packet;
     bool backlog_processed = false;
+
+    ESP_LOGI("TIMESTAMP_TASK", "Started - monitoring buffers...");
+    log_buffer_status("STARTUP");
+
+    static uint32_t packet_counter = 0;
+
+    //time when cmp buffer starts to fill
+    //if (cmp_buffer_count < 2) cmp_fill_start = esp_timer_get_time() / 1000L;
     
     while (1) {
+
+        //mark the time when cmp buffer starts to fill (to check buffer flush timeout)
+        if (cmp_buffer.count < 2) cmp_fill_start = esp_timer_get_time() / 1000L;
 
         //Get the NTP system time using gettimeofday(), and check if system time is already updated using epoch time
         struct timeval tv_check;
@@ -594,14 +419,21 @@ void timestamp_task(void *param) {
                 //add to this the pre-sync system time of first packet, and then add drift between both timers
                 packet.sys_time = (first_synced_epoch - first_synced_esp_ms + presync_systime + timer_delta) / 1000L;
                 
-                // Push to CMP buffer
-                if (!cmp_buffer_push(&packet)) ESP_LOGW("TIMESTAMP_TASK", "CMP buffer full during backlog! Packet dropped.");
-                backlog_count++;
-
-                // Yield every 10 packets to allow rx_task to queue new incoming packets
-                //if (backlog_count % 10 == 0) {
-                //    vTaskDelay(1);  
-                //}
+                uint8_t compressed_pkt[MAX_BINARY_PACKET_SIZE];
+                size_t compressed_len = 0;
+                
+                compress_packet(packet.data, packet.data_len, compressed_pkt, &compressed_len);
+                
+                // Only push if compression produced output (compressed_len > 0)
+                if (compressed_len > 0) {
+                    memcpy(packet.data, compressed_pkt, compressed_len);
+                    packet.data_len = compressed_len;
+                    
+                    if (!cmp_buffer_push(&packet)) ESP_LOGW("TIMESTAMP_TASK", "CMP buffer full during backlog! Packet dropped.");
+                    backlog_count++;
+                }
+                
+                if (backlog_count % 20 == 0 && backlog_count > 0) log_buffer_status("BACKLOG");
             }
             
             //While loop for backward timestamping completed
@@ -616,34 +448,43 @@ void timestamp_task(void *param) {
             // Continue to main while loop for further processing
             continue;
         }
-    
         
         //if time not valid yet, wait and fill RT buffer itself
         else if (!time_is_valid) vTaskDelay(pdMS_TO_TICKS(100));
         
         //if time is valid and no untimestamped backlog in buffer
         else {
-            
-            int rt_count = uxQueueMessagesWaiting(rt_buffer);
-            
-            // ALWAYS drain RT buffer continuously (no threshold check)
-            // Use short timeout to check for packets, if none then sleep briefly
             if (xQueueReceive(rt_buffer, &packet, pdMS_TO_TICKS(10)) == pdTRUE) {
-
-                //LOG RT buffer utilization every 50 packets
-                static int forward_log_counter = 0;
-                if (forward_log_counter++ % 50 == 0) {
-                    ESP_LOGI("TIMESTAMP_TASK", "RT buffer utilization: %d/%d packets", uxQueueMessagesWaiting(rt_buffer), RT_BUFFER_SIZE);
-                }
+                packet_counter++;
                 
-                //While sending, use gettimeofday() system time for timestamping
+                // Timestamp packet
                 struct timeval tv_now;
                 gettimeofday(&tv_now, NULL);
                 packet.sys_time = tv_now.tv_sec;
                 
-                //Push to CMP buffer
-                if (!cmp_buffer_push(&packet)) {
-                    ESP_LOGW("TIMESTAMP_TASK", "CMP buffer full! Packet dropped.");
+                // *** CHECK FORCE TIMEOUT ***
+                check_force_timeout(packet.sys_time);
+                
+                // *** ADD COMPRESSION HERE ***
+                uint8_t compressed_pkt[MAX_BINARY_PACKET_SIZE];
+                size_t compressed_len = 0;
+                
+                compress_packet(packet.data, packet.data_len, compressed_pkt, &compressed_len);
+                
+                // Only push if compression produced output
+                if (compressed_len > 0) {
+                    ESP_LOGI("TIMESTAMP_TASK", "Pkt %lu: Compressed %d→%d, pushing to CMP (count will be %lu)",
+                            packet_counter, packet.data_len, compressed_len, cmp_buffer_count() + 1);
+
+                    memcpy(packet.data, compressed_pkt, compressed_len);
+                    packet.data_len = compressed_len;
+                    
+                    if (!cmp_buffer_push(&packet)) ESP_LOGW("TIMESTAMP_TASK", "CMP buffer full! Packet dropped.");
+                }
+
+                else {
+                    ESP_LOGI("TIMESTAMP_TASK", "Pkt %lu: SKIPPED (len=0), CMP count stays at %lu",
+                    packet_counter, cmp_buffer_count());
                 }
             } 
             else {
@@ -655,23 +496,14 @@ void timestamp_task(void *param) {
 }
 
 
-
-
-
-
-
-
-
 /*
 This function initializes the CMP buffer, WiFi connection, and SNTP service.
 */
 void time_init(void) {
     ESP_LOGI("TIMER", "Timestamp system initialized at %lld us", esp_timer_get_time());
     
-    // Initialize CMP buffer
     cmp_buffer_init();
-    
-    // Initialize WiFi
+    compression_init();
     wifi_init();
     
     // Start SNTP task
