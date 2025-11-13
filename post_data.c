@@ -1,6 +1,7 @@
 #include "esp_http_client.h"
 #include "timestamp.h"
 #include "post_data.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "freertos/task.h"
 #include "freertos/FreeRTOS.h"
@@ -12,21 +13,19 @@
 
 // Configuration for batching logic
 // Reduced from 50 to 30 to save RAM (~3kB savings)
-#define MAX_BATCH_PACKETS 30  
+#define MAX_BATCH_PACKETS 75
 #define BATCH_TIMEOUT_MS 1500
 
 #define MODIFIED_PACKET_BUFFER_SIZE 90
 #define MAX_PAYLOAD_SIZE (MODIFIED_PACKET_BUFFER_SIZE * MAX_BATCH_PACKETS)
 
+//Function to send Base-64 encoded data to provided server via HTTP POST. Content-Type is set to "text/plain" for Base64 data.
 
-/*
-Function to send Base-64 encoded data to provided server via HTTP POST. Content-Type is set to "text/plain" for Base64 data.
-*/
 void send_packet_via_http(const uint8_t *data, size_t len) {
 
     //set the http client configuration using given parameters, provide url of server to be used
     esp_http_client_config_t config = {
-        .url = "http://192.168.1.143:5000/esp32/data",
+        .url = "http://192.168.1.101:5000/esp32/data",
         .method = HTTP_METHOD_POST,
         .timeout_ms = 10000,
     };
@@ -61,10 +60,9 @@ void send_packet_via_http(const uint8_t *data, size_t len) {
 }
 
 
-/*
-This function pops from the CMP buffer at LT and sends data by calling send_packet function above
-It formats the packets with the time in #T format and applies base-64 encoding as well
-*/
+
+//This function pops from the CMP buffer at LT and sends data by calling send_packet function above
+//It formats the packets with the time in #T format and applies base-64 encoding as well
 void http_post_task(void *arg) {
 
     //create array of packets 
@@ -99,8 +97,8 @@ void http_post_task(void *arg) {
         // Check CMP buffer level
         uint32_t cmp_count = cmp_buffer_count();
         
-        // Pop packets from CMP buffer when LT is reached
-        if (cmp_count >= CMP_BUFFER_LT) {
+        // Pop packets from CMP buffer when LT is reached or timeout has occured since last time buffer was empty
+        if (cmp_count >= CMP_BUFFER_LT || ((esp_timer_get_time() / 1000L) - cmp_fill_start >= send_data_timeout)) {
 
             //LOG
             ESP_LOGI("HTTP_POST", "DEBUG: MAX_BATCH_PACKETS = %d", MAX_BATCH_PACKETS);
@@ -144,18 +142,14 @@ void http_post_task(void *arg) {
                     ESP_LOGI("HTTP_POST", "Sending TIMESTAMPED batch - %d packets", packets_in_batch);
                     
                     // Log first packet's epoch time for verification
-                    if (packets_in_batch > 0) {
-                        ESP_LOGI("HTTP_POST", "First packet epoch: %lld (0x%08lX)", 
-                                 batch_array[0].sys_time, (unsigned long)batch_array[0].sys_time);
-                    }
+                    if (packets_in_batch > 0) ESP_LOGI("HTTP_POST", "First packet epoch: %lld (0x%08lX)", batch_array[0].sys_time, (unsigned long)batch_array[0].sys_time);
                     
                     for (int i = 0; i < packets_in_batch; i++) {
                         timestamped_packet_t *pkt = &batch_array[i];
                         
                         // Create #T timestamp header
                         char timestamp_header[16];
-                        int header_len = snprintf(timestamp_header, sizeof(timestamp_header), "#T%08lX",
-                                                 (unsigned long)pkt->sys_time);
+                        int header_len = snprintf(timestamp_header, sizeof(timestamp_header), "#T%08lX", (unsigned long)pkt->sys_time);
                         
                         //LOG : first timestamp header
                         if (i == 0) ESP_LOGI("HTTP_POST", "Timestamp header: '%s' (len=%d)", timestamp_header, header_len);
@@ -194,9 +188,7 @@ void http_post_task(void *arg) {
             
         } 
         
-        else {
-            // CMP buffer below LT, wait for more packets
-            vTaskDelay(pdMS_TO_TICKS(200));
-        }
+        // CMP buffer below LT, wait for more packets
+        else vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
